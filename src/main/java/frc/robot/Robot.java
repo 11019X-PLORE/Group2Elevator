@@ -4,6 +4,7 @@
 
 package frc.robot;
 
+import edu.wpi.first.wpilibj.RobotBase;
 import edu.wpi.first.wpilibj2.command.CommandScheduler;
 import org.littletonrobotics.junction.LoggedRobot;
 import org.littletonrobotics.junction.Logger;
@@ -23,8 +24,11 @@ public class Robot extends LoggedRobot {
    */
   public Robot() {
     Logger.addDataReceiver(new NT4Publisher());
+    // AdvantageKit replaces the inputs with the logged ones while replaying, so the publisher above
+    // is all a replay session needs; nothing here has to branch on it.
     Logger.start();
-    robotContainer = new RobotContainer();
+    // On the laptop there are no drives to talk to: RobotContainer swaps in the mock mechanism.
+    robotContainer = new RobotContainer(RobotBase.isReal());
   }
 
   /**
