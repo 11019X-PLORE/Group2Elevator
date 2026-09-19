@@ -50,10 +50,15 @@ wpi.java.debugJni = false
 // Set this to true to enable desktop support.
 def includeDesktopSupport = true
 
+// Compile the @AutoLog-generated *AutoLogged classes (AdvantageKit input logging).
+sourceSets.main.java.srcDirs 'build/generated/sources/annotationProcessor/java/main'
+
 // Defining my dependencies. In this case, WPILib (+ friends), and vendor libraries.
 // Also defines JUnit 5.
 dependencies {
     annotationProcessor wpi.java.deps.wpilibAnnotations()
+    // Generates the *AutoLogged classes for @AutoLog input containers (AdvantageKit replay).
+    annotationProcessor 'org.littletonrobotics.akit:akit-autolog:26.0.2'
     implementation wpi.java.deps.wpilib()
     implementation wpi.java.vendor.java()
 
