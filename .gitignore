@@ -185,3 +185,7 @@ compile_commands.json
 
 # Eclipse generated file for annotation processors
 .factorypath
+
+# Local-only per AGENTS.md section 5: AI configs and engineering logs never enter the repo.
+AGENTS.md
+工程日志/
