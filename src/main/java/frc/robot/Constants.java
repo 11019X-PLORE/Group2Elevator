@@ -21,6 +21,11 @@ public final class Constants {
     // Station before relying on them: both commands are inert if the button never reports.
     public static final int ELEVATOR_REZERO_BUTTON = 7;
     public static final int ELEVATOR_WORK_PRESET_BUTTON = 8;
+    // Triangle: runs the demo profile from the deploy directory (see DEMO_PROFILE_FILE).
+    public static final int ELEVATOR_PROFILE_BUTTON = 4;
+    // L1, hold-to-run: applies the characterization voltage from NetworkTables while held.
+    // Hold-to-run rather than one-press on purpose — releasing the button is the e-stop.
+    public static final int ELEVATOR_CHARACTERIZE_BUTTON = 5;
 
     private OperatorConstants() {}
   }
@@ -97,6 +102,37 @@ public final class Constants {
     // Live-tunable, and 0 disables the age check outright (the "device never reported" and
     // "transaction failed" checks stay active either way).
     public static final double DEFAULT_SENSOR_TIMEOUT_MILLISECONDS = 100.0;
+
+    // =========================================================================
+    // PROFILE FOLLOWING (轨迹跟随). MotionProfile files come from
+    // tools/profile-generator and live in src/main/deploy/profiles; they are in
+    // travel-fraction space, so nothing scales them on the robot. The follower's
+    // feedforward gains deliberately default to zero — same policy as the gravity
+    // feedforward above: until Kv/Ka are measured on the bench (see
+    // docs/CALIBRATION.md), the follower is pure proportional tracking of the
+    // profile's moving setpoint, which is the safe subset of its behavior.
+    // =========================================================================
+
+    // The demo binding's profile, relative to the deploy directory.
+    public static final String DEMO_PROFILE_FILE = "profiles/zeroToWork.json";
+    // A profile may only start when the mechanism is within this fraction of its start
+    // waypoint; a rig elsewhere refuses the move instead of yanking toward the trajectory.
+    public static final double PROFILE_START_TOLERANCE_FRACTION = 0.05;
+    public static final double DEFAULT_PROFILE_KP_VOLTS_PER_TRAVEL = 2.0;
+    // V per (travel/s) and V per (travel/s^2): measure before raising from zero.
+    public static final double DEFAULT_PROFILE_KV_VOLTS_SECONDS_PER_TRAVEL = 0.0;
+    public static final double DEFAULT_PROFILE_KA_VOLTS_SECONDS_SQUARED_PER_TRAVEL = 0.0;
+
+    // =========================================================================
+    // CHARACTERIZATION (动力学辨识). Button 5 (hold-to-run) applies the
+    // NetworkTables voltage directly, subject to every limit the other modes
+    // respect — the dashboard value is signed in the extending direction and is
+    // clamped to the bus, so a mistyped entry cannot ask for more than the
+    // motors could ever see. See docs/CALIBRATION.md for the measurement
+    // recipes this mode exists to run.
+    // =========================================================================
+
+    public static final double MAX_CHARACTERIZATION_VOLTS = 12.0;
 
     private Elevator() {}
   }

@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import edu.wpi.first.wpilibj2.command.Command;
 import java.util.function.DoubleSupplier;
 import frc.robot.ElevatorCalibration;
+import frc.robot.MotionProfile;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -717,6 +718,249 @@ class ElevatorSubsystemTest {
     command.end(false);
 
     assertEquals(0.6, io.getExtensionFraction(), 0.02);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Profile following
+
+  /** A three-sample trajectory through 0.5 over one second, at rest at both ends. */
+  private static MotionProfile profileThroughHalfTravel() {
+    return MotionProfile.of(
+        "testProfile",
+        new double[] {0.0, 1.0, 2.0},
+        new double[] {0.25, 0.5, 0.75},
+        new double[] {0.0, 0.5, 0.0},
+        new double[] {0.0, 0.0, 0.0});
+  }
+
+  @Test
+  void profileFollowRefusesToStartWhenTheMechanismIsNotAtTheProfileStart() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.6; // fraction 0.4 against a 4.0 travel; the profile starts at 0.25
+    io.motor2Rotations = -1.6;
+    ManualClock clock = new ManualClock();
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(4.0),
+            ElevatorSubsystem.Tunables.withProfileGains(2.0, 0.0, 0.0, 0.0),
+            clock);
+    Command command = elevator.followProfileCommand(profileThroughHalfTravel());
+
+    clock.advance(CYCLE_SECONDS);
+    command.initialize();
+    elevator.periodic();
+
+    assertTrue(command.isFinished());
+    assertTrue(elevator.profileStartWasRefused(), "the start mismatch must be visible in the log");
+    assertEquals(0.0, io.motor1Voltage, TOL);
+    assertEquals(0.0, io.motor2Voltage, TOL);
+    command.end(false);
+  }
+
+  @Test
+  void profileFeedforwardAndFeedbackShapeTheVoltage() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.0; // fraction 0.25: the profile's own start waypoint
+    io.motor2Rotations = -1.0;
+    ManualClock clock = new ManualClock();
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(4.0),
+            ElevatorSubsystem.Tunables.withProfileGains(2.0, 3.0, 1.0, 0.1),
+            clock);
+    Command command = elevator.followProfileCommand(profileThroughHalfTravel());
+    command.initialize();
+
+    // Half a second in, the sample interpolates to x = 0.375, v = 0.25, a = 0. With the
+    // mechanism still at the start: 2 * (0.375 - 0.25) + 3 * 0.25 + 1 * 0 + 0.1 = 1.1 V.
+    clock.advance(0.5);
+    elevator.periodic();
+
+    assertEquals(0.375, elevator.getTargetExtensionFraction(), 1e-6);
+    assertEquals(1.1, io.motor1Voltage, 1e-6);
+    assertEquals(-1.1, io.motor2Voltage, 1e-6);
+    assertFalse(command.isFinished());
+    command.end(false);
+  }
+
+  @Test
+  void profileFollowWithoutFeedforwardTracksTheMovingSetpointProportionally() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.0;
+    io.motor2Rotations = -1.0;
+    ManualClock clock = new ManualClock();
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(4.0),
+            ElevatorSubsystem.Tunables.withProfileGains(2.0, 0.0, 0.0, 0.0),
+            clock);
+    Command command = elevator.followProfileCommand(profileThroughHalfTravel());
+    command.initialize();
+
+    clock.advance(0.5);
+    elevator.periodic();
+
+    // Only the proportional term: 2 * (0.375 - 0.25) = 0.25 V toward the moving setpoint.
+    assertEquals(0.25, io.motor1Voltage, 1e-6);
+    command.end(false);
+  }
+
+  @Test
+  void profileFollowIsRefusedWhileUncalibrated() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.0;
+    io.motor2Rotations = -2.0;
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(0.0),
+            ElevatorSubsystem.Tunables.withProfileGains(2.0, 0.0, 0.0, 0.0),
+            () -> 0.0);
+    Command command = elevator.followProfileCommand(profileThroughHalfTravel());
+
+    command.initialize();
+    elevator.periodic();
+
+    assertTrue(command.isFinished());
+    assertEquals(0.0, io.motor1Voltage, TOL);
+  }
+
+  @Test
+  void simulatedProfileFollowRunsToTheGoalAndFinishes() {
+    ManualClock clock = new ManualClock();
+    ElevatorIOSim io = new ElevatorIOSim(3.4, 3.4, clock);
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(3.4),
+            ElevatorSubsystem.Tunables.withProfileGains(4.0, 0.0, 0.0, 0.2),
+            clock);
+    MotionProfile toSixTenths =
+        MotionProfile.of(
+            "toSixTenths",
+            new double[] {0.0, 1.0, 2.0, 3.0},
+            new double[] {0.0, 0.25, 0.45, 0.6},
+            new double[] {0.0, 0.25, 0.25, 0.0},
+            new double[] {0.0, 0.0, 0.0, 0.0});
+    Command command = elevator.followProfileCommand(toSixTenths);
+    command.initialize();
+
+    int cycles = 0;
+    while (!command.isFinished() && cycles < 600) {
+      clock.advance(CYCLE_SECONDS);
+      elevator.periodic();
+      cycles++;
+    }
+    command.end(false);
+
+    assertTrue(command.isFinished(), "the profile follow never finished");
+    assertTrue(elevator.profileIsComplete());
+    assertEquals(0.6, io.getExtensionFraction(), 0.02);
+    assertEquals("ElevatorFollowProfile:toSixTenths", elevator.getLastMoveActionName());
+    assertTrue(elevator.getLastMoveDurationSeconds() >= 3.0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Characterization mode
+
+  @Test
+  void characterizationAppliesTheSignedDashboardVoltageInBothDirections() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.7; // mid-travel, away from both stops
+    io.motor2Rotations = -1.7;
+    double[] requestedVolts = {1.5};
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(3.4),
+            ElevatorSubsystem.Tunables.withCharacterizationVoltage(() -> requestedVolts[0]),
+            () -> 0.0);
+    Command command = elevator.characterizationVoltageCommand();
+
+    runMode(elevator, command, 1);
+    assertEquals(1.5, io.motor1Voltage, TOL);
+    assertEquals(-1.5, io.motor2Voltage, TOL);
+
+    // The value is re-read every cycle, so a dashboard sweep shows up without restarting.
+    requestedVolts[0] = -1.5;
+    elevator.periodic();
+    assertEquals(-1.5, io.motor1Voltage, TOL);
+    command.end(false);
+    assertEquals(0.0, io.motor1Voltage, TOL);
+  }
+
+  @Test
+  void characterizationStopsAtBothHardLimits() {
+    FakeElevatorIO atTop = new FakeElevatorIO();
+    atTop.motor1Rotations = -3.4;
+    atTop.motor2Rotations = -3.4;
+    ElevatorSubsystem upRig =
+        new ElevatorSubsystem(
+            atTop,
+            ElevatorCalibration.ofShared(3.4),
+            ElevatorSubsystem.Tunables.withCharacterizationVoltage(() -> 2.0),
+            () -> 0.0);
+    runMode(upRig, upRig.characterizationVoltageCommand(), 1);
+    assertEquals(0.0, atTop.motor1Voltage, TOL);
+
+    FakeElevatorIO atBottom = new FakeElevatorIO();
+    ElevatorSubsystem downRig =
+        new ElevatorSubsystem(
+            atBottom,
+            ElevatorCalibration.ofShared(3.4),
+            ElevatorSubsystem.Tunables.withCharacterizationVoltage(() -> -2.0),
+            () -> 0.0);
+    runMode(downRig, downRig.characterizationVoltageCommand(), 1);
+    assertEquals(0.0, atBottom.motor1Voltage, TOL);
+  }
+
+  @Test
+  void characterizationVoltageIsClampedToTheBusAndNonFiniteFallsBackToZero() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.7;
+    io.motor2Rotations = -1.7;
+    double[] requestedVolts = {50.0};
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(3.4),
+            ElevatorSubsystem.Tunables.withCharacterizationVoltage(() -> requestedVolts[0]),
+            () -> 0.0);
+    Command command = elevator.characterizationVoltageCommand();
+
+    runMode(elevator, command, 1);
+    assertEquals(12.0, io.motor1Voltage, TOL);
+
+    requestedVolts[0] = Double.NaN;
+    elevator.periodic();
+    assertEquals(0.0, io.motor1Voltage, TOL);
+    command.end(false);
+  }
+
+  @Test
+  void characterizationStopsWhenTheSensorsGoUntrusted() {
+    FakeElevatorIO io = new FakeElevatorIO();
+    io.motor1Rotations = -1.7;
+    io.motor2Rotations = -1.7;
+    ElevatorSubsystem elevator =
+        new ElevatorSubsystem(
+            io,
+            ElevatorCalibration.ofShared(3.4),
+            ElevatorSubsystem.Tunables.withCharacterizationVoltage(() -> 1.5),
+            () -> 0.0);
+    Command command = elevator.characterizationVoltageCommand();
+    runMode(elevator, command, 1);
+    assertEquals(1.5, io.motor1Voltage, TOL);
+
+    io.motor1PositionIsResponding = false;
+    elevator.periodic();
+
+    assertEquals(0.0, io.motor1Voltage, TOL);
+    assertTrue(command.isFinished(), "an untrusted rig must end the measurement, not sit in it");
+    command.end(false);
   }
 
   // ---------------------------------------------------------------------------

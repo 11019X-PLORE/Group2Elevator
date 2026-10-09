@@ -1,0 +1,32 @@
+{
+  "solver": {
+    "intervals": 200,
+    "min_time_seconds": 0.1,
+    "max_time_seconds": 10.0
+  },
+  "regularization": {
+    "velocity": 0.01,
+    "acceleration": 0.0,
+    "position": 0.0
+  },
+  "joints": [
+    {
+      "name": "elevator",
+      "units": "travel-fraction (0 = calibrated zero, 1 = full extension)",
+      "min": 0.0,
+      "max": 1.0,
+      "max_velocity": 0.5,
+      "max_acceleration": 1.0,
+      "max_jerk": 25.0
+    }
+  ],
+  "profiles": [
+    { "name": "zeroToMid", "waypoints": [[0.0], [0.5]] },
+    { "name": "midToZero", "waypoints": [[0.5], [0.0]] },
+    { "name": "zeroToWork", "waypoints": [[0.0], [0.75]] },
+    { "name": "workToZero", "waypoints": [[0.75], [0.0]] },
+    { "name": "midToWork", "waypoints": [[0.5], [0.75]] },
+    { "name": "workToMid", "waypoints": [[0.75], [0.5]] }
+  ],
+  "notes": "PLACEHOLDER limits - nothing on this rig has been characterized yet. max_velocity 0.5 travel/s and max_acceleration 1.0 travel/s^2 are conservative guesses chosen only so the pipeline can be exercised end to end. Measure the real envelope (docs/CALIBRATION.md section on dynamics characterization), fill it in here, regenerate, and delete this note."
+}

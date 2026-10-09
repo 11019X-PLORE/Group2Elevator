@@ -4,12 +4,16 @@
 
 package frc.robot;
 
+import edu.wpi.first.wpilibj.Filesystem;
 import edu.wpi.first.wpilibj2.command.button.CommandPS5Controller;
 import frc.robot.Constants.OperatorConstants;
 import frc.robot.subsystems.ElevatorIO;
 import frc.robot.subsystems.ElevatorIOTalonFX;
 import frc.robot.subsystems.ElevatorIOSim;
 import frc.robot.subsystems.ElevatorSubsystem;
+import java.io.IOException;
+
+import java.util.Optional;
 
 /**
  * The wiring: which IO implementation backs the subsystem, which calibration it runs against, and
@@ -60,5 +64,35 @@ public class RobotContainer {
         .button(OperatorConstants.ELEVATOR_WORK_PRESET_BUTTON)
         .onTrue(
             elevatorSubsystem.moveToFractionCommand(Constants.Elevator.WORK_EXTENSION_FRACTION));
+    // Demo of the profile follower: one file from the deploy directory, one button. The profiles
+    // shipped today carry PLACEHOLDER limits (see their metadata) — regenerate them from
+    // tools/profile-generator after the bench characterization before trusting their timing.
+    loadProfile(Constants.Elevator.DEMO_PROFILE_FILE)
+        .ifPresent(
+            profile ->
+                driverController
+                    .button(OperatorConstants.ELEVATOR_PROFILE_BUTTON)
+                    .onTrue(elevatorSubsystem.followProfileCommand(profile)));
+    // Hold-to-run: the button applies the dashboard characterization voltage, releasing it stops.
+    driverController
+        .button(OperatorConstants.ELEVATOR_CHARACTERIZE_BUTTON)
+        .whileTrue(elevatorSubsystem.characterizationVoltageCommand());
+  }
+
+  /**
+   * Loads a profile relative to the deploy directory (which desktop simulation also serves). A
+   * missing or malformed file logs and leaves the binding absent rather than failing robot
+   * startup — an unloadable profile must cost one button, not the whole program.
+   */
+  private static Optional<MotionProfile> loadProfile(String relativePath) {
+    try {
+      return Optional.of(
+          MotionProfile.fromJson(
+              Filesystem.getDeployDirectory().toPath().resolve(relativePath)));
+    } catch (IOException | RuntimeException exception) {
+      System.err.printf(
+          "Elevator profile %s could not be loaded: %s%n", relativePath, exception.getMessage());
+      return Optional.empty();
+    }
   }
 }

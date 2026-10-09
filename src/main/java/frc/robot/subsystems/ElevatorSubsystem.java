@@ -11,6 +11,7 @@ import edu.wpi.first.wpilibj2.command.FunctionalCommand;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import frc.robot.Constants;
 import frc.robot.ElevatorCalibration;
+import frc.robot.MotionProfile;
 import java.util.function.BooleanSupplier;
 import java.util.function.DoubleSupplier;
 import org.littletonrobotics.junction.Logger;
@@ -41,6 +42,14 @@ import org.littletonrobotics.junction.networktables.LoggedNetworkNumber;
  * Constants.Elevator#EXTENSION_VOLTAGE_SIGN}). Calibration travels are magnitudes. A mechanism that
  * turns out to be wired the other way shows up as a contradirectional reading, which
  * {@link #periodic()} detects and latches as a fault instead of driving away from its limits.
+ *
+ * <p><b>Two measurement-and-profile modes ride the same rails.</b> {@code FOLLOWING_PROFILE}
+ * tracks a pre-computed {@link MotionProfile}'s moving setpoint (feedforward plus proportional
+ * feedback, capped at the same movement voltage as everything else), and {@code CHARACTERIZING}
+ * applies a signed dashboard voltage for bench characterization. Both go through the identical
+ * {@code periodic()}-owned path: the same calibration gate, the same limit cuts in the same cycle,
+ * the same slew and speed ceilings, and the same direction monitor — a profile or a measurement
+ * shapes a move, it never authorizes one.
  */
 public class ElevatorSubsystem extends SubsystemBase {
   /** What the elevator is being told to do. Only {@link #periodic()} turns this into volts. */
@@ -49,7 +58,11 @@ public class ElevatorSubsystem extends SubsystemBase {
     EXTENDING,
     RETRACTING,
     MOVING_TO_MID,
-    MOVING_TO_FRACTION
+    MOVING_TO_FRACTION,
+    /** Sample a {@link MotionProfile} over time and track its moving setpoint. */
+    FOLLOWING_PROFILE,
+    /** Apply the signed characterization voltage from NetworkTables, for bench measurement. */
+    CHARACTERIZING
   }
 
   private static final double MINIMUM_VELOCITY_TIMESTEP_SECONDS = 1e-6;
@@ -79,6 +92,10 @@ public class ElevatorSubsystem extends SubsystemBase {
   private double positionKpVoltsPerTravel;
   private double positionArriveToleranceFraction;
   private double gravityFeedforwardVolts;
+  private double profileKpVoltsPerTravel;
+  private double profileKvVoltsSecondsPerTravel;
+  private double profileKaVoltsSecondsSquaredPerTravel;
+  private double characterizationVoltageVolts;
 
   // Finite-difference velocity estimate, low-passed, in fractions of travel per second.
   private double previousMotor1ExtensionFraction;
@@ -96,6 +113,15 @@ public class ElevatorSubsystem extends SubsystemBase {
   private double targetExtensionFraction;
   private boolean midMovementIsExtension;
   private boolean positionIsArrived;
+
+  // The profile being followed, and where its clock started. A profile starts from rest at its
+  // own first waypoint, so the mechanism must already be there: beginProfile refuses the move
+  // when it is not, rather than yanking the mechanism toward the trajectory.
+  private MotionProfile profile;
+  private double profileStartTimestampSeconds;
+  private double profileTimeSeconds;
+  private boolean profileIsComplete;
+  private boolean profileStartWasRefused;
 
   // Records kept for the spec's "every action has a completion time".
   private double moveStartTimestampSeconds;
@@ -315,6 +341,26 @@ public class ElevatorSubsystem extends SubsystemBase {
     return targetExtensionFraction;
   }
 
+  /** The profile being followed (or the last one), for the log and the bindings. */
+  public String getProfileName() {
+    return profile == null ? "" : profile.name();
+  }
+
+  /** True when the last profile request was refused because the mechanism was elsewhere. */
+  public boolean profileStartWasRefused() {
+    return profileStartWasRefused;
+  }
+
+  /** True once the followed profile's trajectory has run out (it may still be settling). */
+  public boolean profileIsComplete() {
+    return profileIsComplete;
+  }
+
+  /** Seconds into the followed profile; stops advancing at the trajectory's duration. */
+  public double getProfileTimeSeconds() {
+    return profileTimeSeconds;
+  }
+
   // ---------------------------------------------------------------------------
   // Commands
 
@@ -367,6 +413,64 @@ public class ElevatorSubsystem extends SubsystemBase {
             () -> !canDrive() || (positionIsArrived && !hold),
             this)
         .withName(name);
+  }
+
+  /**
+   * Follows a pre-computed {@link MotionProfile} from its own start waypoint to its goal. The
+   * mechanism must already be within {@link Constants.Elevator#PROFILE_START_TOLERANCE_FRACTION}
+   * of the profile's start when the command begins — a rig elsewhere refuses the move at zero
+   * volts instead of being dragged toward the trajectory, the same "a wrong precondition refuses
+   * to move" rule the rezero guard uses. Finishes once the trajectory has run out and the
+   * mechanism is inside the arrive window; past the trajectory's end the follower holds the
+   * final position exactly like a preset, so a badly-tracking move parks on the goal until
+   * something interrupts it rather than declaring victory early.
+   */
+  public Command followProfileCommand(MotionProfile requested) {
+    String name = "ElevatorFollowProfile:" + requested.name();
+    return new FunctionalCommand(
+            () -> beginProfile(requested, name),
+            () -> {},
+            interrupted -> endAction(),
+            () -> !canDrive() || profileStartWasRefused || (profileIsComplete && positionIsArrived),
+            this)
+        .withName(name);
+  }
+
+  private void beginProfile(MotionProfile requested, String name) {
+    profile = requested;
+    profileStartWasRefused =
+        !canDrive()
+            || Math.abs(averageTravelFraction() - requested.initialPosition())
+                > Constants.Elevator.PROFILE_START_TOLERANCE_FRACTION;
+    profileStartTimestampSeconds = now();
+    profileTimeSeconds = 0.0;
+    profileIsComplete = false;
+    requestMode(profileStartWasRefused ? MotionMode.STOPPED : MotionMode.FOLLOWING_PROFILE);
+    beginAction(name);
+    if (profileStartWasRefused) {
+      System.out.printf(
+          "Elevator profile %s refused: the mechanism is at %.3f, the profile starts at %.3f%n",
+          requested.name(), averageTravelFraction(), requested.initialPosition());
+    }
+  }
+
+  /**
+   * Hold-to-run characterization: applies the signed NetworkTables voltage
+   * ({@code Elevator Characterization Voltage}, positive = extending) through every gate the
+   * other modes respect. Bound with {@code whileTrue} so releasing the button is the stop; the
+   * command itself only ends early when driving is refused.
+   */
+  public Command characterizationVoltageCommand() {
+    return new FunctionalCommand(
+            () -> {
+              requestMode(MotionMode.CHARACTERIZING);
+              beginAction("ElevatorCharacterize");
+            },
+            () -> {},
+            interrupted -> endAction(),
+            () -> !canDrive(),
+            this)
+        .withName("ElevatorCharacterize");
   }
 
   /**
@@ -451,6 +555,8 @@ public class ElevatorSubsystem extends SubsystemBase {
           case RETRACTING -> atLowerLimit() ? 0.0 : -extensionVoltage();
           case MOVING_TO_MID -> midMovementVoltage();
           case MOVING_TO_FRACTION -> positionVoltage();
+          case FOLLOWING_PROFILE -> profileVoltage(timestampSeconds);
+          case CHARACTERIZING -> characterizationVoltage();
         };
     applyMovementVoltage(movementVoltage, timestampSeconds);
     updateDirectionMonitor(timestampSeconds, movementVoltage);
@@ -507,6 +613,63 @@ public class ElevatorSubsystem extends SubsystemBase {
       return 0.0;
     }
     return commandVolts;
+  }
+
+  /**
+   * Samples the profile at the time since its start and tracks the moving setpoint. The output
+   * is the profile feedforward (Kv·v + Ka·a + gravity, all in travel-fraction units) plus a
+   * proportional term on the tracking error, capped at the same fixed movement voltage every
+   * other mode respects — so a profile can shape a move but never out-authorize the limit moves.
+   *
+   * <p>The feedforward gains default to zero on purpose: until the bench characterization has
+   * measured them, the follower is pure proportional tracking of the setpoint, which is the safe
+   * subset of its behavior (and with all gains at zero Kv/Ka it degenerates exactly to the
+   * preset controller following a moving target). Past the trajectory's end the sample clamps to
+   * the at-rest goal, so the same loop settles into the arrive window and the command finishes.
+   */
+  private double profileVoltage(double timestampSeconds) {
+    if (profile == null) {
+      return 0.0;
+    }
+    profileTimeSeconds = timestampSeconds - profileStartTimestampSeconds;
+    MotionProfile.Sample sample = profile.sample(profileTimeSeconds);
+    profileIsComplete = profileTimeSeconds >= profile.durationSeconds();
+    targetExtensionFraction = sample.position();
+    double errorFraction = sample.position() - averageTravelFraction();
+    if (profileIsComplete && Math.abs(errorFraction) <= positionArriveToleranceFraction) {
+      positionIsArrived = true;
+    }
+    double cap = Math.abs(extensionVoltage());
+    double extensionMagnitudeVolts =
+        profileKpVoltsPerTravel * errorFraction
+            + profileKvVoltsSecondsPerTravel * sample.velocity()
+            + profileKaVoltsSecondsSquaredPerTravel * sample.acceleration()
+            + gravityFeedforwardVolts;
+    double commandVolts = MathUtil.clamp(extensionVolts(extensionMagnitudeVolts), -cap, cap);
+    // Never push past a hard limit along a profile, whatever the follower asks for.
+    boolean pushingUpward = commandVolts * extensionDirectionSign() > 0.0;
+    if (pushingUpward && atUpperLimit()) {
+      return extensionVolts(gravityFeedforwardVolts);
+    }
+    if (!pushingUpward && atLowerLimit()) {
+      return 0.0;
+    }
+    return commandVolts;
+  }
+
+  /**
+   * The sanitized characterization voltage, signed in the extending direction and clamped to the
+   * bus, stopped by the hard limits like every other mode. The value is re-read every cycle, so
+   * an operator can sweep it on the dashboard while the button is held.
+   */
+  private double characterizationVoltage() {
+    if (characterizationVoltageVolts > 0.0 && atUpperLimit()) {
+      return 0.0;
+    }
+    if (characterizationVoltageVolts < 0.0 && atLowerLimit()) {
+      return 0.0;
+    }
+    return extensionVolts(characterizationVoltageVolts);
   }
 
   /**
@@ -659,6 +822,21 @@ public class ElevatorSubsystem extends SubsystemBase {
     gravityFeedforwardVolts =
         tunables.nonNegative(
             tunables.gravityFeedforwardVolts, Constants.Elevator.DEFAULT_GRAVITY_FEEDFORWARD_VOLTS);
+    profileKpVoltsPerTravel =
+        tunables.nonNegative(
+            tunables.profileKpVoltsPerTravel,
+            Constants.Elevator.DEFAULT_PROFILE_KP_VOLTS_PER_TRAVEL);
+    profileKvVoltsSecondsPerTravel =
+        tunables.nonNegative(
+            tunables.profileKvVoltsSecondsPerTravel,
+            Constants.Elevator.DEFAULT_PROFILE_KV_VOLTS_SECONDS_PER_TRAVEL);
+    profileKaVoltsSecondsSquaredPerTravel =
+        tunables.nonNegative(
+            tunables.profileKaVoltsSecondsSquaredPerTravel,
+            Constants.Elevator.DEFAULT_PROFILE_KA_VOLTS_SECONDS_SQUARED_PER_TRAVEL);
+    characterizationVoltageVolts =
+        tunables.signedClamped(
+            tunables.characterizationVoltageVolts, Constants.Elevator.MAX_CHARACTERIZATION_VOLTS);
   }
 
   private void logOutputs() {
@@ -704,6 +882,11 @@ public class ElevatorSubsystem extends SubsystemBase {
         "Elevator/Motor2TravelFractionPerSecond", motor2ExtensionFractionVelocityPerSecond, "x/s");
     Logger.recordOutput("Elevator/LastMoveDurationSeconds", lastMoveDurationSeconds, "seconds");
     Logger.recordOutput("Elevator/LastMoveActionName", lastMoveActionName);
+    Logger.recordOutput("Elevator/ProfileName", getProfileName());
+    Logger.recordOutput("Elevator/ProfileTimeSeconds", profileTimeSeconds, "seconds");
+    Logger.recordOutput("Elevator/ProfileComplete", profileIsComplete);
+    Logger.recordOutput("Elevator/ProfileStartRefused", profileStartWasRefused);
+    Logger.recordOutput("Elevator/CharacterizationVoltage", characterizationVoltageVolts, "volts");
   }
 
   private double motor1TravelRotationsForLog() {
@@ -733,6 +916,11 @@ public class ElevatorSubsystem extends SubsystemBase {
     final DoubleSupplier positionKpVoltsPerTravel;
     final DoubleSupplier positionArriveToleranceFraction;
     final DoubleSupplier gravityFeedforwardVolts;
+    final DoubleSupplier profileKpVoltsPerTravel;
+    final DoubleSupplier profileKvVoltsSecondsPerTravel;
+    final DoubleSupplier profileKaVoltsSecondsSquaredPerTravel;
+    /** Signed characterization voltage, positive = extending; see {@code characterizationVoltage}. */
+    final DoubleSupplier characterizationVoltageVolts;
 
     Tunables(
         DoubleSupplier maxTravelFractionPerSecond,
@@ -741,12 +929,40 @@ public class ElevatorSubsystem extends SubsystemBase {
         DoubleSupplier positionKpVoltsPerTravel,
         DoubleSupplier positionArriveToleranceFraction,
         DoubleSupplier gravityFeedforwardVolts) {
+      this(
+          maxTravelFractionPerSecond,
+          voltageSlewVoltsPerSecond,
+          sensorTimeoutMilliseconds,
+          positionKpVoltsPerTravel,
+          positionArriveToleranceFraction,
+          gravityFeedforwardVolts,
+          () -> Constants.Elevator.DEFAULT_PROFILE_KP_VOLTS_PER_TRAVEL,
+          () -> Constants.Elevator.DEFAULT_PROFILE_KV_VOLTS_SECONDS_PER_TRAVEL,
+          () -> Constants.Elevator.DEFAULT_PROFILE_KA_VOLTS_SECONDS_SQUARED_PER_TRAVEL,
+          () -> 0.0);
+    }
+
+    Tunables(
+        DoubleSupplier maxTravelFractionPerSecond,
+        DoubleSupplier voltageSlewVoltsPerSecond,
+        DoubleSupplier sensorTimeoutMilliseconds,
+        DoubleSupplier positionKpVoltsPerTravel,
+        DoubleSupplier positionArriveToleranceFraction,
+        DoubleSupplier gravityFeedforwardVolts,
+        DoubleSupplier profileKpVoltsPerTravel,
+        DoubleSupplier profileKvVoltsSecondsPerTravel,
+        DoubleSupplier profileKaVoltsSecondsSquaredPerTravel,
+        DoubleSupplier characterizationVoltageVolts) {
       this.maxTravelFractionPerSecond = maxTravelFractionPerSecond;
       this.voltageSlewVoltsPerSecond = voltageSlewVoltsPerSecond;
       this.sensorTimeoutMilliseconds = sensorTimeoutMilliseconds;
       this.positionKpVoltsPerTravel = positionKpVoltsPerTravel;
       this.positionArriveToleranceFraction = positionArriveToleranceFraction;
       this.gravityFeedforwardVolts = gravityFeedforwardVolts;
+      this.profileKpVoltsPerTravel = profileKpVoltsPerTravel;
+      this.profileKvVoltsSecondsPerTravel = profileKvVoltsSecondsPerTravel;
+      this.profileKaVoltsSecondsSquaredPerTravel = profileKaVoltsSecondsSquaredPerTravel;
+      this.characterizationVoltageVolts = characterizationVoltageVolts;
     }
 
     /** Every entry the operator can move mid-match, with its validated default. */
@@ -763,7 +979,15 @@ public class ElevatorSubsystem extends SubsystemBase {
           networkNumber("/SmartDashboard/Elevator Arrive Tolerance (travel)",
               Constants.Elevator.DEFAULT_POSITION_ARRIVE_TOLERANCE_FRACTION),
           networkNumber("/SmartDashboard/Elevator Gravity Feedforward (V)",
-              Constants.Elevator.DEFAULT_GRAVITY_FEEDFORWARD_VOLTS));
+              Constants.Elevator.DEFAULT_GRAVITY_FEEDFORWARD_VOLTS),
+          networkNumber("/SmartDashboard/Elevator Profile kP (V/travel)",
+              Constants.Elevator.DEFAULT_PROFILE_KP_VOLTS_PER_TRAVEL),
+          networkNumber("/SmartDashboard/Elevator Profile kV (V·s/travel)",
+              Constants.Elevator.DEFAULT_PROFILE_KV_VOLTS_SECONDS_PER_TRAVEL),
+          networkNumber("/SmartDashboard/Elevator Profile kA (V·s²/travel)",
+              Constants.Elevator.DEFAULT_PROFILE_KA_VOLTS_SECONDS_SQUARED_PER_TRAVEL),
+          networkNumber("/SmartDashboard/Elevator Characterization Voltage (V)",
+              0.0));
     }
 
     /**
@@ -800,6 +1024,40 @@ public class ElevatorSubsystem extends SubsystemBase {
           () -> Constants.Elevator.DEFAULT_GRAVITY_FEEDFORWARD_VOLTS);
     }
 
+    /** Profile-following gains over the ceilings-off base, for the follower's tests. */
+    static Tunables withProfileGains(
+        double profileKpVoltsPerTravel,
+        double profileKvVoltsSecondsPerTravel,
+        double profileKaVoltsSecondsSquaredPerTravel,
+        double gravityFeedforwardVolts) {
+      return new Tunables(
+          () -> 0.0,
+          () -> 0.0,
+          () -> Constants.Elevator.DEFAULT_SENSOR_TIMEOUT_MILLISECONDS,
+          () -> Constants.Elevator.DEFAULT_POSITION_KP_VOLTS_PER_TRAVEL,
+          () -> Constants.Elevator.DEFAULT_POSITION_ARRIVE_TOLERANCE_FRACTION,
+          () -> gravityFeedforwardVolts,
+          () -> profileKpVoltsPerTravel,
+          () -> profileKvVoltsSecondsPerTravel,
+          () -> profileKaVoltsSecondsSquaredPerTravel,
+          () -> 0.0);
+    }
+
+    /** Characterization voltage over the ceilings-off base, for the measurement-mode tests. */
+    static Tunables withCharacterizationVoltage(DoubleSupplier voltageVolts) {
+      return new Tunables(
+          () -> 0.0,
+          () -> 0.0,
+          () -> Constants.Elevator.DEFAULT_SENSOR_TIMEOUT_MILLISECONDS,
+          () -> Constants.Elevator.DEFAULT_POSITION_KP_VOLTS_PER_TRAVEL,
+          () -> Constants.Elevator.DEFAULT_POSITION_ARRIVE_TOLERANCE_FRACTION,
+          () -> Constants.Elevator.DEFAULT_GRAVITY_FEEDFORWARD_VOLTS,
+          () -> Constants.Elevator.DEFAULT_PROFILE_KP_VOLTS_PER_TRAVEL,
+          () -> Constants.Elevator.DEFAULT_PROFILE_KV_VOLTS_SECONDS_PER_TRAVEL,
+          () -> Constants.Elevator.DEFAULT_PROFILE_KA_VOLTS_SECONDS_SQUARED_PER_TRAVEL,
+          voltageVolts);
+    }
+
     private static DoubleSupplier networkNumber(String key, double defaultValue) {
       LoggedNetworkNumber entry = new LoggedNetworkNumber(key, defaultValue);
       return entry::get;
@@ -813,6 +1071,16 @@ public class ElevatorSubsystem extends SubsystemBase {
     double nonNegative(DoubleSupplier supplier, double fallback) {
       double value = supplier.getAsDouble();
       return Double.isFinite(value) && value >= 0.0 ? value : fallback;
+    }
+
+    /**
+     * The one signed tunable: a non-finite entry falls back to zero volts (the safe direction for
+     * a measurement mode) and anything finite is clamped to the bus, because no dashboard typo
+     * should ask the motors for more than they could ever physically see.
+     */
+    double signedClamped(DoubleSupplier supplier, double limitVolts) {
+      double value = supplier.getAsDouble();
+      return Double.isFinite(value) ? MathUtil.clamp(value, -limitVolts, limitVolts) : 0.0;
     }
   }
 }

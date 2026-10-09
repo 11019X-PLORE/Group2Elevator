@@ -189,3 +189,7 @@ compile_commands.json
 # Local-only per AGENTS.md section 5: AI configs and engineering logs never enter the repo.
 AGENTS.md
 工程日志/
+
+# Python venv for tools/profile-generator (casadi needs 3.9-3.12; the system python is newer)
+.venv-profiles/
+tools/profile-generator/.venv/
